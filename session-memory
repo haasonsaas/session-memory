@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 import hashlib
 import subprocess
+import re
 
 # Configuration
 DEFAULT_DB_PATH = os.path.expanduser("~/.session-memory.db")
@@ -148,11 +149,186 @@ class SessionMemory:
         except:
             return None
     
+    def infer_context(self, file_path):
+        """Infer context based on file type and content"""
+        try:
+            file_path = Path(file_path)
+            
+            # File type contexts
+            contexts = {
+                '.py': 'Examining Python code',
+                '.js': 'Examining JavaScript code', 
+                '.ts': 'Examining TypeScript code',
+                '.jsx': 'Examining React component',
+                '.tsx': 'Examining React TypeScript component',
+                '.css': 'Examining styles',
+                '.scss': 'Examining SCSS styles',
+                '.html': 'Examining HTML markup',
+                '.json': 'Examining configuration/data',
+                '.md': 'Examining documentation',
+                '.yml': 'Examining YAML configuration',
+                '.yaml': 'Examining YAML configuration',
+                '.toml': 'Examining TOML configuration',
+                '.dockerfile': 'Examining Docker configuration',
+                '.sql': 'Examining database schema/queries',
+                '.sh': 'Examining shell script',
+                '.bash': 'Examining bash script',
+                '.zsh': 'Examining zsh script'
+            }
+            
+            # Special filename patterns
+            special_files = {
+                'package.json': 'Examining project dependencies and scripts',
+                'requirements.txt': 'Examining Python dependencies',
+                'cargo.toml': 'Examining Rust project configuration',
+                'dockerfile': 'Examining Docker container setup',
+                'makefile': 'Examining build configuration',
+                'readme': 'Reading project documentation',
+                'changelog': 'Examining project history',
+                'license': 'Examining project license',
+                '.gitignore': 'Examining git ignore patterns',
+                '.env': 'Examining environment configuration',
+                'config': 'Examining configuration file'
+            }
+            
+            filename_lower = file_path.name.lower()
+            
+            # Check special files first
+            for pattern, context in special_files.items():
+                if pattern in filename_lower:
+                    return context
+            
+            # Check file extensions
+            suffix = file_path.suffix.lower()
+            if suffix in contexts:
+                context = contexts[suffix]
+                
+                # Try to read first few lines for more specific context
+                try:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        first_lines = ''.join(f.readlines()[:10]).lower()
+                        
+                        # Detect specific patterns
+                        if 'test' in filename_lower or 'spec' in filename_lower:
+                            context = f"Examining {suffix[1:]} test file"
+                        elif 'api' in filename_lower or 'endpoint' in filename_lower:
+                            context = f"Examining {suffix[1:]} API code"
+                        elif 'component' in filename_lower:
+                            context = f"Examining {suffix[1:]} component"
+                        elif 'util' in filename_lower or 'helper' in filename_lower:
+                            context = f"Examining {suffix[1:]} utility functions"
+                        elif 'config' in filename_lower or 'setting' in filename_lower:
+                            context = f"Examining {suffix[1:]} configuration"
+                        elif re.search(r'class\s+\w+', first_lines):
+                            context = f"Examining {suffix[1:]} class definition"
+                        elif re.search(r'function\s+\w+|def\s+\w+', first_lines):
+                            context = f"Examining {suffix[1:]} function definitions"
+                        elif 'import' in first_lines or 'from' in first_lines:
+                            context = f"Examining {suffix[1:]} module imports and setup"
+                            
+                except:
+                    pass
+                    
+                return context
+            
+            # Fallback
+            if file_path.is_dir():
+                return "Examining directory structure"
+            else:
+                return f"Examining {suffix[1:] if suffix else 'file'}"
+                
+        except:
+            return "Examining file"
+    
+    def get_session_analytics(self):
+        """Get analytics for current session"""
+        session_id = self.get_current_session()
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        analytics = {}
+        
+        # Session duration
+        cursor.execute("""
+            SELECT started_at, last_active FROM sessions WHERE id = ?
+        """, (session_id,))
+        result = cursor.fetchone()
+        if result:
+            started = datetime.fromisoformat(result[0].replace('Z', '+00:00'))
+            last_active = datetime.fromisoformat(result[1].replace('Z', '+00:00'))
+            analytics['duration_minutes'] = int((last_active - started).total_seconds() / 60)
+        
+        # Activity counts
+        cursor.execute("""
+            SELECT 
+                (SELECT COUNT(*) FROM file_reads WHERE session_id = ?) as reads,
+                (SELECT COUNT(*) FROM changes WHERE session_id = ?) as changes,
+                (SELECT COUNT(*) FROM tests WHERE session_id = ?) as tests,
+                (SELECT COUNT(*) FROM notes WHERE session_id = ?) as notes,
+                (SELECT COUNT(*) FROM errors WHERE session_id = ?) as errors
+        """, (session_id, session_id, session_id, session_id, session_id))
+        
+        result = cursor.fetchone()
+        if result:
+            analytics.update({
+                'files_read': result[0],
+                'changes_made': result[1], 
+                'tests_run': result[2],
+                'notes_added': result[3],
+                'errors_logged': result[4]
+            })
+        
+        # Test success rate
+        cursor.execute("""
+            SELECT result, COUNT(*) FROM tests 
+            WHERE session_id = ? GROUP BY result
+        """, (session_id,))
+        
+        test_results = dict(cursor.fetchall())
+        total_tests = sum(test_results.values())
+        if total_tests > 0:
+            analytics['test_success_rate'] = test_results.get('pass', 0) / total_tests * 100
+        
+        # Most active file types
+        cursor.execute("""
+            SELECT 
+                CASE 
+                    WHEN file_path LIKE '%.py' THEN 'Python'
+                    WHEN file_path LIKE '%.js' THEN 'JavaScript'
+                    WHEN file_path LIKE '%.ts' THEN 'TypeScript'
+                    WHEN file_path LIKE '%.jsx' THEN 'React'
+                    WHEN file_path LIKE '%.tsx' THEN 'React TS'
+                    WHEN file_path LIKE '%.css' THEN 'CSS'
+                    WHEN file_path LIKE '%.md' THEN 'Markdown'
+                    WHEN file_path LIKE '%.json' THEN 'JSON'
+                    ELSE 'Other'
+                END as file_type,
+                COUNT(*) as count
+            FROM (
+                SELECT file_path FROM file_reads WHERE session_id = ?
+                UNION ALL
+                SELECT file_path FROM changes WHERE session_id = ?
+            ) 
+            GROUP BY file_type
+            ORDER BY count DESC
+            LIMIT 5
+        """, (session_id, session_id))
+        
+        analytics['file_types'] = dict(cursor.fetchall())
+        
+        conn.close()
+        return analytics
+    
     def log_read(self, file_path, context=None):
         """Log that a file was read"""
         session_id = self.get_current_session()
         file_path = os.path.abspath(file_path)
         file_hash = self.file_hash(file_path)
+        
+        # Use inferred context if none provided
+        if context is None:
+            context = self.infer_context(file_path)
         
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -400,6 +576,10 @@ def main():
                               help="Export format")
     export_parser.add_argument("--output", help="Output file (default: stdout)")
     
+    # Analytics command
+    analytics_parser = subparsers.add_parser("analytics", help="Show session analytics")
+    analytics_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    
     args = parser.parse_args()
     
     if not args.command:
@@ -475,6 +655,56 @@ def main():
             print(f"📤 Session exported to {args.output}")
         else:
             print(data)
+    
+    elif args.command == "analytics":
+        analytics = sm.get_session_analytics()
+        
+        if args.json:
+            print(json.dumps(analytics, indent=2))
+        else:
+            print("\n📊 Session Analytics")
+            print("=" * 50)
+            
+            if 'duration_minutes' in analytics:
+                duration = analytics['duration_minutes']
+                if duration < 60:
+                    print(f"⏱️  Session duration: {duration} minutes")
+                else:
+                    hours = duration // 60
+                    minutes = duration % 60
+                    print(f"⏱️  Session duration: {hours}h {minutes}m")
+            
+            print(f"📖 Files read: {analytics.get('files_read', 0)}")
+            print(f"✏️  Changes made: {analytics.get('changes_made', 0)}")
+            print(f"🧪 Tests run: {analytics.get('tests_run', 0)}")
+            print(f"📝 Notes added: {analytics.get('notes_added', 0)}")
+            print(f"🚨 Errors logged: {analytics.get('errors_logged', 0)}")
+            
+            if 'test_success_rate' in analytics:
+                rate = analytics['test_success_rate']
+                emoji = "✅" if rate >= 80 else "⚠️" if rate >= 60 else "❌"
+                print(f"{emoji} Test success rate: {rate:.1f}%")
+            
+            if analytics.get('file_types'):
+                print("\n🗂️  Most active file types:")
+                for file_type, count in list(analytics['file_types'].items())[:5]:
+                    print(f"   {file_type}: {count} files")
+            
+            # Productivity insights
+            total_activity = (analytics.get('files_read', 0) + 
+                            analytics.get('changes_made', 0) + 
+                            analytics.get('tests_run', 0))
+            
+            if total_activity > 0 and analytics.get('duration_minutes', 0) > 0:
+                activity_rate = total_activity / analytics['duration_minutes']
+                print(f"\n⚡ Activity rate: {activity_rate:.1f} actions/minute")
+                
+                if activity_rate > 2:
+                    print("   🔥 High productivity session!")
+                elif activity_rate > 1:
+                    print("   👍 Good productivity")
+                else:
+                    print("   🤔 Consider taking breaks between focused work")
 
 if __name__ == "__main__":
     main()
