@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+
+"""
+session-memory - Persistent context tracking for AI agents
+
+A lightweight CLI tool that maintains session state across AI interactions,
+storing file reads, changes, test results, and contextual notes in SQLite.
+"""
+
+import argparse
+import sqlite3
+import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+import hashlib
+import subprocess
+
+# Configuration
+DEFAULT_DB_PATH = os.path.expanduser("~/.session-memory.db")
+SCHEMA_VERSION = 1
+
+class SessionMemory:
+    def __init__(self, db_path=None):
+        self.db_path = db_path or DEFAULT_DB_PATH
+        self.init_database()
+    
+    def init_database(self):
+        """Initialize the SQLite database with schema"""
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        
+        # Create tables
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_path TEXT NOT NULL,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                description TEXT,
+                status TEXT DEFAULT 'active'
+            );
+            
+            CREATE TABLE IF NOT EXISTS file_reads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER,
+                file_path TEXT NOT NULL,
+                file_hash TEXT,
+                read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                context TEXT,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            );
+            
+            CREATE TABLE IF NOT EXISTS changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER,
+                file_path TEXT NOT NULL,
+                change_type TEXT NOT NULL, -- 'create', 'modify', 'delete'
+                description TEXT,
+                before_hash TEXT,
+                after_hash TEXT,
+                changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            );
+            
+            CREATE TABLE IF NOT EXISTS tests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER,
+                command TEXT NOT NULL,
+                result TEXT NOT NULL, -- 'pass', 'fail', 'error'
+                output TEXT,
+                run_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            );
+            
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER,
+                content TEXT NOT NULL,
+                tags TEXT, -- JSON array of tags
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            );
+            
+            CREATE TABLE IF NOT EXISTS errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER,
+                error_type TEXT NOT NULL,
+                error_message TEXT NOT NULL,
+                file_path TEXT,
+                context TEXT,
+                occurred_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            );
+            
+            -- Indexes for performance
+            CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_path);
+            CREATE INDEX IF NOT EXISTS idx_file_reads_session ON file_reads(session_id);
+            CREATE INDEX IF NOT EXISTS idx_changes_session ON changes(session_id);
+            CREATE INDEX IF NOT EXISTS idx_tests_session ON tests(session_id);
+            CREATE INDEX IF NOT EXISTS idx_notes_session ON notes(session_id);
+            CREATE INDEX IF NOT EXISTS idx_errors_session ON errors(session_id);
+        """)
+        
+        conn.commit()
+        conn.close()
+    
+    def get_current_session(self):
+        """Get or create current session based on working directory"""
+        project_path = os.getcwd()
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Try to find active session for current project
+        cursor.execute("""
+            SELECT id FROM sessions 
+            WHERE project_path = ? AND status = 'active'
+            ORDER BY last_active DESC LIMIT 1
+        """, (project_path,))
+        
+        result = cursor.fetchone()
+        if result:
+            session_id = result[0]
+            # Update last_active
+            cursor.execute("""
+                UPDATE sessions SET last_active = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (session_id,))
+        else:
+            # Create new session
+            cursor.execute("""
+                INSERT INTO sessions (project_path, description)
+                VALUES (?, ?)
+            """, (project_path, f"Session for {os.path.basename(project_path)}"))
+            session_id = cursor.lastrowid
+        
+        conn.commit()
+        conn.close()
+        return session_id
+    
+    def file_hash(self, file_path):
+        """Calculate MD5 hash of file content"""
+        try:
+            with open(file_path, 'rb') as f:
+                return hashlib.md5(f.read()).hexdigest()
+        except:
+            return None
+    
+    def log_read(self, file_path, context=None):
+        """Log that a file was read"""
+        session_id = self.get_current_session()
+        file_path = os.path.abspath(file_path)
+        file_hash = self.file_hash(file_path)
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            INSERT INTO file_reads (session_id, file_path, file_hash, context)
+            VALUES (?, ?, ?, ?)
+        """, (session_id, file_path, file_hash, context))
+        
+        conn.commit()
+        conn.close()
+        return cursor.lastrowid
+    
+    def log_change(self, file_path, change_type, description=None):
+        """Log a file change"""
+        session_id = self.get_current_session()
+        file_path = os.path.abspath(file_path)
+        
+        # Get before and after hashes if file exists
+        before_hash = None
+        after_hash = None
+        
+        if change_type in ['modify', 'delete']:
+            # For modify/delete, we should have recorded the file before
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT file_hash FROM file_reads 
+                WHERE session_id = ? AND file_path = ?
+                ORDER BY read_at DESC LIMIT 1
+            """, (session_id, file_path))
+            result = cursor.fetchone()
+            if result:
+                before_hash = result[0]
+            conn.close()
+        
+        if change_type in ['create', 'modify']:
+            after_hash = self.file_hash(file_path)
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            INSERT INTO changes (session_id, file_path, change_type, description, before_hash, after_hash)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (session_id, file_path, change_type, description, before_hash, after_hash))
+        
+        conn.commit()
+        conn.close()
+        return cursor.lastrowid
+    
+    def log_test(self, command, result, output=None):
+        """Log test execution"""
+        session_id = self.get_current_session()
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            INSERT INTO tests (session_id, command, result, output)
+            VALUES (?, ?, ?, ?)
+        """, (session_id, command, result, output))
+        
+        conn.commit()
+        conn.close()
+        return cursor.lastrowid
+    
+    def add_note(self, content, tags=None):
+        """Add a contextual note"""
+        session_id = self.get_current_session()
+        tags_json = json.dumps(tags) if tags else None
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            INSERT INTO notes (session_id, content, tags)
+            VALUES (?, ?, ?)
+        """, (session_id, content, tags_json))
+        
+        conn.commit()
+        conn.close()
+        return cursor.lastrowid
+    
+    def log_error(self, error_type, error_message, file_path=None, context=None):
+        """Log an error"""
+        session_id = self.get_current_session()
+        file_path = os.path.abspath(file_path) if file_path else None
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            INSERT INTO errors (session_id, error_type, error_message, file_path, context)
+            VALUES (?, ?, ?, ?, ?)
+        """, (session_id, error_type, error_message, file_path, context))
+        
+        conn.commit()
+        conn.close()
+        return cursor.lastrowid
+    
+    def query_session(self, query_type=None, limit=50):
+        """Query session data"""
+        session_id = self.get_current_session()
+        
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        if query_type == "reads":
+            cursor.execute("""
+                SELECT file_path, read_at, context
+                FROM file_reads
+                WHERE session_id = ?
+                ORDER BY read_at DESC
+                LIMIT ?
+            """, (session_id, limit))
+        elif query_type == "changes":
+            cursor.execute("""
+                SELECT file_path, change_type, description, changed_at
+                FROM changes
+                WHERE session_id = ?
+                ORDER BY changed_at DESC
+                LIMIT ?
+            """, (session_id, limit))
+        elif query_type == "tests":
+            cursor.execute("""
+                SELECT command, result, output, run_at
+                FROM tests
+                WHERE session_id = ?
+                ORDER BY run_at DESC
+                LIMIT ?
+            """, (session_id, limit))
+        elif query_type == "notes":
+            cursor.execute("""
+                SELECT content, tags, created_at
+                FROM notes
+                WHERE session_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (session_id, limit))
+        elif query_type == "errors":
+            cursor.execute("""
+                SELECT error_type, error_message, file_path, context, occurred_at
+                FROM errors
+                WHERE session_id = ?
+                ORDER BY occurred_at DESC
+                LIMIT ?
+            """, (session_id, limit))
+        else:
+            # Summary query
+            cursor.execute("""
+                SELECT 
+                    'reads' as type, COUNT(*) as count
+                FROM file_reads WHERE session_id = ?
+                UNION ALL
+                SELECT 'changes' as type, COUNT(*) as count
+                FROM changes WHERE session_id = ?
+                UNION ALL
+                SELECT 'tests' as type, COUNT(*) as count
+                FROM tests WHERE session_id = ?
+                UNION ALL
+                SELECT 'notes' as type, COUNT(*) as count
+                FROM notes WHERE session_id = ?
+                UNION ALL
+                SELECT 'errors' as type, COUNT(*) as count
+                FROM errors WHERE session_id = ?
+            """, (session_id, session_id, session_id, session_id, session_id))
+        
+        results = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return results
+    
+    def export_session(self, format_type="json"):
+        """Export session data"""
+        session_id = self.get_current_session()
+        
+        data = {
+            "session_id": session_id,
+            "exported_at": datetime.now().isoformat(),
+            "reads": self.query_session("reads", limit=1000),
+            "changes": self.query_session("changes", limit=1000),
+            "tests": self.query_session("tests", limit=1000),
+            "notes": self.query_session("notes", limit=1000),
+            "errors": self.query_session("errors", limit=1000)
+        }
+        
+        if format_type == "json":
+            return json.dumps(data, indent=2, default=str)
+        else:
+            return str(data)
+
+def main():
+    parser = argparse.ArgumentParser(description="AI Agent Session Memory")
+    parser.add_argument("--db", help="Database path", default=DEFAULT_DB_PATH)
+    
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+    
+    # Init command
+    init_parser = subparsers.add_parser("init", help="Initialize new session")
+    init_parser.add_argument("--description", help="Session description")
+    
+    # Read command
+    read_parser = subparsers.add_parser("read", help="Log file read")
+    read_parser.add_argument("file_path", help="File that was read")
+    read_parser.add_argument("--context", help="Context about why it was read")
+    
+    # Change command
+    change_parser = subparsers.add_parser("change", help="Log file change")
+    change_parser.add_argument("file_path", help="File that was changed")
+    change_parser.add_argument("description", help="Description of change")
+    change_parser.add_argument("--type", choices=["create", "modify", "delete"], 
+                              default="modify", help="Type of change")
+    
+    # Test command
+    test_parser = subparsers.add_parser("test", help="Log test execution")
+    test_parser.add_argument("command", help="Test command that was run")
+    test_parser.add_argument("result", choices=["pass", "fail", "error"], 
+                            help="Test result")
+    test_parser.add_argument("--output", help="Test output")
+    
+    # Note command
+    note_parser = subparsers.add_parser("note", help="Add contextual note")
+    note_parser.add_argument("content", help="Note content")
+    note_parser.add_argument("--tags", nargs="*", help="Tags for the note")
+    
+    # Error command
+    error_parser = subparsers.add_parser("error", help="Log error")
+    error_parser.add_argument("type", help="Error type")
+    error_parser.add_argument("message", help="Error message")
+    error_parser.add_argument("--file", help="File where error occurred")
+    error_parser.add_argument("--context", help="Additional context")
+    
+    # Query command
+    query_parser = subparsers.add_parser("query", help="Query session data")
+    query_parser.add_argument("type", nargs="?", 
+                             choices=["reads", "changes", "tests", "notes", "errors"],
+                             help="Type of data to query")
+    query_parser.add_argument("--limit", type=int, default=20, help="Limit results")
+    query_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    
+    # Export command
+    export_parser = subparsers.add_parser("export", help="Export session data")
+    export_parser.add_argument("--format", choices=["json"], default="json",
+                              help="Export format")
+    export_parser.add_argument("--output", help="Output file (default: stdout)")
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        return
+    
+    sm = SessionMemory(args.db)
+    
+    if args.command == "init":
+        session_id = sm.get_current_session()
+        print(f"✅ Session {session_id} initialized for {os.getcwd()}")
+    
+    elif args.command == "read":
+        entry_id = sm.log_read(args.file_path, args.context)
+        print(f"📖 Logged read of {args.file_path} (ID: {entry_id})")
+    
+    elif args.command == "change":
+        entry_id = sm.log_change(args.file_path, args.type, args.description)
+        print(f"✏️  Logged {args.type} of {args.file_path} (ID: {entry_id})")
+    
+    elif args.command == "test":
+        entry_id = sm.log_test(args.command, args.result, args.output)
+        result_emoji = "✅" if args.result == "pass" else "❌" if args.result == "fail" else "⚠️"
+        print(f"{result_emoji} Logged test: {args.command} -> {args.result} (ID: {entry_id})")
+    
+    elif args.command == "note":
+        entry_id = sm.add_note(args.content, args.tags)
+        print(f"📝 Added note (ID: {entry_id})")
+    
+    elif args.command == "error":
+        entry_id = sm.log_error(args.type, args.message, args.file, args.context)
+        print(f"🚨 Logged error: {args.type} (ID: {entry_id})")
+    
+    elif args.command == "query":
+        results = sm.query_session(args.type, args.limit)
+        
+        if args.json:
+            print(json.dumps(results, indent=2, default=str))
+        else:
+            if args.type:
+                print(f"\n📊 Last {len(results)} {args.type}:")
+                for result in results:
+                    if args.type == "reads":
+                        print(f"  📖 {result['file_path']} ({result['read_at']})")
+                        if result['context']:
+                            print(f"     Context: {result['context']}")
+                    elif args.type == "changes":
+                        print(f"  ✏️  {result['change_type']}: {result['file_path']} ({result['changed_at']})")
+                        if result['description']:
+                            print(f"     {result['description']}")
+                    elif args.type == "tests":
+                        emoji = "✅" if result['result'] == "pass" else "❌" if result['result'] == "fail" else "⚠️"
+                        print(f"  {emoji} {result['command']} -> {result['result']} ({result['run_at']})")
+                    elif args.type == "notes":
+                        print(f"  📝 {result['content']} ({result['created_at']})")
+                        if result['tags']:
+                            tags = json.loads(result['tags'])
+                            print(f"     Tags: {', '.join(tags)}")
+                    elif args.type == "errors":
+                        print(f"  🚨 {result['error_type']}: {result['error_message']} ({result['occurred_at']})")
+                        if result['file_path']:
+                            print(f"     File: {result['file_path']}")
+            else:
+                print("\n📊 Session Summary:")
+                for result in results:
+                    print(f"  {result['type']}: {result['count']}")
+    
+    elif args.command == "export":
+        data = sm.export_session(args.format)
+        if args.output:
+            with open(args.output, 'w') as f:
+                f.write(data)
+            print(f"📤 Session exported to {args.output}")
+        else:
+            print(data)
+
+if __name__ == "__main__":
+    main()
